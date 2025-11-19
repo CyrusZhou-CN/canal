@@ -46,8 +46,7 @@ import com.taobao.tddl.dbsync.binlog.LogEvent;
 public class MysqlEventParser extends AbstractMysqlEventParser implements CanalEventParser, CanalHASwitchable {
 
     private CanalHAController    haController                      = null;
-
-    private int                  defaultConnectionTimeoutInSeconds = 30;       // sotimeout
+    private int                  defaultConnectionTimeoutInSeconds = 30;
     private int                  receiveBufferSize                 = 64 * 1024;
     private int                  sendBufferSize                    = 64 * 1024;
     // 数据库信息
@@ -69,8 +68,8 @@ public class MysqlEventParser extends AbstractMysqlEventParser implements CanalE
     private int                  dumpErrorCount                    = 0;        // binlogDump失败异常计数
     private int                  dumpErrorCountThreshold           = 2;        // binlogDump失败异常计数阀值
     private boolean              rdsOssMode                        = false;
-    private boolean              autoResetLatestPosMode            = false;    // true:
-                                                                                // binlog被删除之后，自动按最新的数据订阅
+    private boolean              autoResetLatestPosMode            = false;    // binlog被删除之后，自动按最新的数据订阅
+    private boolean              multiStreamEnable;                            // support for polardbx binlog-x
 
     protected ErosaConnection buildErosaConnection() {
         return buildMysqlConnection(this.runningInfo);
@@ -253,7 +252,6 @@ public class MysqlEventParser extends AbstractMysqlEventParser implements CanalE
                 reconnect = true;
                 logger.warn("connect failed by ", e);
             }
-
         }
 
         public MysqlConnection getMysqlConnection() {
@@ -303,8 +301,8 @@ public class MysqlEventParser extends AbstractMysqlEventParser implements CanalE
         MysqlConnection connection = new MysqlConnection(runningInfo.getAddress(),
             runningInfo.getUsername(),
             runningInfo.getPassword(),
-            connectionCharsetNumber,
-            runningInfo.getDefaultDatabaseName());
+            runningInfo.getDefaultDatabaseName(),
+            runningInfo.getSslInfo());
         connection.getConnector().setReceiveBufferSize(receiveBufferSize);
         connection.getConnector().setSendBufferSize(sendBufferSize);
         connection.getConnector().setSoTimeout(defaultConnectionTimeoutInSeconds * 1000);
@@ -341,7 +339,7 @@ public class MysqlEventParser extends AbstractMysqlEventParser implements CanalE
 
     protected EntryPosition findStartPosition(ErosaConnection connection) throws IOException {
         if (isGTIDMode()) {
-            // GTID模式下，CanalLogPositionManager里取最后的gtid，没有则取instanc配置中的
+            // GTID模式下，CanalLogPositionManager里取最后的gtid，没有则取instance配置中的
             LogPosition logPosition = getLogPositionManager().getLatestIndexBy(destination);
             if (logPosition != null) {
                 // 如果以前是非GTID模式，后来调整为了GTID模式，那么为了保持兼容，需要判断gtid是否为空
@@ -379,7 +377,7 @@ public class MysqlEventParser extends AbstractMysqlEventParser implements CanalE
     protected EntryPosition findEndPositionWithMasterIdAndTimestamp(MysqlConnection connection) {
         MysqlConnection mysqlConnection = (MysqlConnection) connection;
         final EntryPosition endPosition = findEndPosition(mysqlConnection);
-        if (tableMetaTSDB != null) {
+        if (tableMetaTSDB != null || isGTIDMode()) {
             long startTimestamp = System.currentTimeMillis();
             return findAsPerTimestampInSpecificLogFile(mysqlConnection,
                 startTimestamp,
@@ -424,7 +422,8 @@ public class MysqlEventParser extends AbstractMysqlEventParser implements CanalE
             }
 
             if (entryPosition == null) {
-                entryPosition = findEndPositionWithMasterIdAndTimestamp(mysqlConnection); // 默认从当前最后一个位置进行消费
+                entryPosition =
+                        findEndPositionWithMasterIdAndTimestamp(mysqlConnection); // 默认从当前最后一个位置进行消费
             }
 
             // 判断一下是否需要按时间订阅
@@ -665,11 +664,20 @@ public class MysqlEventParser extends AbstractMysqlEventParser implements CanalE
      * 查询当前的binlog位置
      */
     private EntryPosition findEndPosition(MysqlConnection mysqlConnection) {
+        String showSql = "show master status";
         try {
-            ResultSetPacket packet = mysqlConnection.query("show master status");
+            if (mysqlConnection.atLeastMySQL84()) {
+                // 8.4新语法
+                showSql = "show binary log status";
+            } else if (multiStreamEnable) {
+                // 兼容polardb-x的多流binlog
+                showSql = "show master status with " + destination;
+            }
+            ResultSetPacket packet = mysqlConnection.query(showSql);
             List<String> fields = packet.getFieldValues();
             if (CollectionUtils.isEmpty(fields)) {
-                throw new CanalParseException("command : 'show master status' has an error! pls check. you need (at least one of) the SUPER,REPLICATION CLIENT privilege(s) for this operation");
+                throw new CanalParseException(
+                    "command : '" + showSql + "' has an error! pls check. you need (at least one of) the SUPER,REPLICATION CLIENT privilege(s) for this operation");
             }
             EntryPosition endPosition = new EntryPosition(fields.get(0), Long.valueOf(fields.get(1)));
             if (isGTIDMode() && fields.size() > 4) {
@@ -685,7 +693,7 @@ public class MysqlEventParser extends AbstractMysqlEventParser implements CanalE
             }
             return endPosition;
         } catch (IOException e) {
-            throw new CanalParseException("command : 'show master status' has an error!", e);
+            throw new CanalParseException("command : '" + showSql + "' has an error!", e);
         }
     }
 
@@ -694,10 +702,15 @@ public class MysqlEventParser extends AbstractMysqlEventParser implements CanalE
      */
     private EntryPosition findStartPosition(MysqlConnection mysqlConnection) {
         try {
-            ResultSetPacket packet = mysqlConnection.query("show binlog events limit 1");
+            String showSql = "show binlog events limit 1";
+            if (multiStreamEnable) {
+                showSql = "show binlog events with " + destination + " limit 1";
+            }
+            ResultSetPacket packet = mysqlConnection.query(showSql);
             List<String> fields = packet.getFieldValues();
             if (CollectionUtils.isEmpty(fields)) {
-                throw new CanalParseException("command : 'show binlog events limit 1' has an error! pls check. you need (at least one of) the SUPER,REPLICATION CLIENT privilege(s) for this operation");
+                throw new CanalParseException(
+                        "command : 'show binlog events limit 1' has an error! pls check. you need (at least one of) the SUPER,REPLICATION CLIENT privilege(s) for this operation");
             }
             EntryPosition endPosition = new EntryPosition(fields.get(0), Long.valueOf(fields.get(1)));
             return endPosition;
@@ -713,7 +726,12 @@ public class MysqlEventParser extends AbstractMysqlEventParser implements CanalE
     @SuppressWarnings("unused")
     private SlaveEntryPosition findSlavePosition(MysqlConnection mysqlConnection) {
         try {
-            ResultSetPacket packet = mysqlConnection.query("show slave status");
+            String showSql = "show slave status";
+            if (mysqlConnection.atLeastMySQL84()) {
+                // 兼容mysql 8.4
+                showSql = "show replica status";
+            }
+            ResultSetPacket packet = mysqlConnection.query(showSql);
             List<FieldPacket> names = packet.getFieldDescriptors();
             List<String> fields = packet.getFieldValues();
             if (CollectionUtils.isEmpty(fields)) {
@@ -965,5 +983,9 @@ public class MysqlEventParser extends AbstractMysqlEventParser implements CanalE
 
     public void setAutoResetLatestPosMode(boolean autoResetLatestPosMode) {
         this.autoResetLatestPosMode = autoResetLatestPosMode;
+    }
+
+    public void setMultiStreamEnable(boolean multiStreamEnable) {
+        this.multiStreamEnable = multiStreamEnable;
     }
 }

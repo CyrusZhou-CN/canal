@@ -1,19 +1,22 @@
 package com.alibaba.otter.canal.client.adapter.rdb.support;
 
-import com.alibaba.otter.canal.client.adapter.rdb.config.MappingConfig;
-import com.alibaba.otter.canal.client.adapter.support.Util;
-import org.apache.commons.lang.StringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.Reader;
 import java.io.StringReader;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.sql.*;
+import java.time.LocalDateTime;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.Map;
+
+import org.apache.commons.lang.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.alibaba.druid.DbType;
+import com.alibaba.otter.canal.client.adapter.rdb.config.MappingConfig;
+import com.alibaba.otter.canal.client.adapter.support.Util;
 
 public class SyncUtil {
     private static final Logger logger  = LoggerFactory.getLogger(SyncUtil.class);
@@ -219,11 +222,16 @@ public class SyncUtil {
                     pstmt.setTime(i, new java.sql.Time(((java.util.Date) value).getTime()));
                 } else if (value instanceof String) {
                     String v = (String) value;
-                    java.util.Date date = Util.parseDate(v);
-                    if (date != null) {
-                        pstmt.setTime(i, new Time(date.getTime()));
-                    } else {
-                        pstmt.setNull(i, type);
+                    if(Util.isAccuracyOverSecond(v)) {
+                        //the java.sql.time doesn't support for even millisecond, only setObject works here.
+                        pstmt.setObject(i, v);
+                    }else {
+                        java.util.Date date = Util.parseDate(v);
+                        if (date != null) {
+                            pstmt.setTime(i, new Time(date.getTime()));
+                        } else {
+                            pstmt.setNull(i, type);
+                        }
                     }
                 } else {
                     pstmt.setNull(i, type);
@@ -237,11 +245,22 @@ public class SyncUtil {
                 } else if (value instanceof String) {
                     String v = (String) value;
                     if (!v.startsWith("0000-00-00")) {
-                        java.util.Date date = Util.parseDate(v);
-                        if (date != null) {
-                            pstmt.setTimestamp(i, new Timestamp(date.getTime()));
-                        } else {
-                            pstmt.setNull(i, type);
+                        if(Util.isAccuracyOverMillisecond(v)){
+                            //convert to ISO-8601 standard format, with up to nanoseconds (9 digits) precision
+                            LocalDateTime isoDatetime = Util.parseISOLocalDateTime(v);
+                            if (isoDatetime != null) {
+                                pstmt.setTimestamp(i, Timestamp.valueOf(isoDatetime));
+                            } else {
+                                //if can't convert, set to null
+                                pstmt.setNull(i, type);
+                            }
+                        }else {
+                            java.util.Date date = Util.parseDate(v);
+                            if (date != null) {
+                                pstmt.setTimestamp(i, new Timestamp(date.getTime()));
+                            } else {
+                                pstmt.setNull(i, type);
+                            }
                         }
                     } else {
                         pstmt.setObject(i, value);
@@ -255,12 +274,50 @@ public class SyncUtil {
         }
     }
 
-    public static String getDbTableName(MappingConfig.DbMapping dbMapping) {
+    public static String getDbTableName(MappingConfig.DbMapping dbMapping, String dbType) {
         String result = "";
+        String backtick = getBacktickByDbType(dbType);
         if (StringUtils.isNotEmpty(dbMapping.getTargetDb())) {
-            result += ("`" + dbMapping.getTargetDb() + "`.");
+            result += (backtick + dbMapping.getTargetDb() + backtick + ".");
         }
-        result += ("`" + dbMapping.getTargetTable() + "`");
+        result += (backtick + dbMapping.getTargetTable() + backtick);
         return result;
+    }
+
+    public static String getSourceDbTableName(MappingConfig.DbMapping dbMapping, String dbType) {
+        String result = "";
+        String backtick = getBacktickByDbType(dbType);
+        if (StringUtils.isNotEmpty(dbMapping.getDatabase())) {
+            result += (backtick + dbMapping.getDatabase() + backtick + ".");
+        }
+
+        result += (backtick + dbMapping.getTable() + backtick);
+        return result;
+    }
+
+    /**
+     * 根据DbType返回反引号或空字符串
+     *
+     * @param dbTypeName DbType名称
+     * @return 反引号或空字符串
+     */
+    public static String getBacktickByDbType(String dbTypeName) {
+        DbType dbType = DbType.of(dbTypeName);
+        if (dbType == null) {
+            dbType = DbType.other;
+        }
+
+        // 只有当dbType为MySQL/MariaDB或OceanBase时返回反引号
+        switch (dbType) {
+            case mysql:
+            case mariadb:
+            case oceanbase:
+                return "`";
+        //  当dbType 为 postgresql时，返回双引号(避免表名为postgresql的关键字时，sql查询报错)
+            case postgresql:
+                return "\"";
+            default:
+                return "";
+        }
     }
 }

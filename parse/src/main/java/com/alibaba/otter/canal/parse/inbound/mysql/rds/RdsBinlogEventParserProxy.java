@@ -6,6 +6,7 @@ import java.util.concurrent.Executors;
 import org.apache.commons.lang.StringUtils;
 
 import com.alibaba.otter.canal.parse.exception.PositionNotFoundException;
+import com.alibaba.otter.canal.parse.exception.ServerLogPurgedException;
 import com.alibaba.otter.canal.parse.inbound.ParserExceptionHandler;
 import com.alibaba.otter.canal.parse.inbound.mysql.MysqlEventParser;
 
@@ -51,7 +52,6 @@ public class RdsBinlogEventParserProxy extends MysqlEventParser {
             rdsLocalBinlogEventParser.setDestination(destination);
             rdsLocalBinlogEventParser.setAlarmHandler(this.getAlarmHandler());
             rdsLocalBinlogEventParser.setConnectionCharsetStd(this.connectionCharset);
-            rdsLocalBinlogEventParser.setConnectionCharsetNumber(this.connectionCharsetNumber);
             rdsLocalBinlogEventParser.setEnableTsdb(this.enableTsdb);
             rdsLocalBinlogEventParser.setEventBlackFilter(this.eventBlackFilter);
             rdsLocalBinlogEventParser.setFilterQueryDcl(this.filterQueryDcl);
@@ -93,7 +93,7 @@ public class RdsBinlogEventParserProxy extends MysqlEventParser {
     }
 
     private void handleMysqlParserException(Throwable throwable) {
-        if (throwable instanceof PositionNotFoundException) {
+        if (throwable instanceof PositionNotFoundException || throwable instanceof ServerLogPurgedException) {
             logger.info("remove rds not found position, try download rds binlog!");
             executorService.execute(() -> {
                 try {
